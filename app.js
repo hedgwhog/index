@@ -24,6 +24,8 @@ const state = {
   printTarget: null,
   answerStart: null,
   scrolledFor: '',
+  fullEdit: null,
+  activeFullEdit: null,
 };
 
 const IS_TOUCH_SCREEN = matchMedia('(pointer: coarse)').matches;
@@ -168,12 +170,27 @@ function travelText(minutes) {
   return `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ''}`;
 }
 
+const NOTE_SEPARATOR = /(?:^|\s)--(?:\s|$)/;
+
+function cleanNote(note) {
+  return note.trim()
+    .replace(/^\[\s*\]\s*/, '[ ] ')
+    .replace(/^\[[xX✓]\]\s*/, '[x] ');
+}
+
+function splitNotes(text) {
+  return text.split(NOTE_SEPARATOR).map(cleanNote).filter(Boolean).join('\n');
+}
+
 function parseParts(text) {
-  const parts = { title: [], dates: [], times: [], tag: null, location: null, every: null, notes: null, travel: null, travelUnclear: false };
+  const parts = {
+    title: [], dates: [], times: [], tag: null, location: null, every: null, notes: null,
+    travel: null, travelUnclear: false, returnTravel: null, returnUnclear: false, allDay: false,
+  };
 
   const notesStart = text.search(/(^|\s)--(\s|$)/);
   if (notesStart >= 0) {
-    parts.notes = text.slice(notesStart).replace(/^\s*--\s*/, '').trim();
+    parts.notes = splitNotes(text.slice(notesStart));
     text = text.slice(0, notesStart);
   }
 
@@ -186,11 +203,16 @@ function parseParts(text) {
 
     if (word.startsWith('"')) { (locationWords || parts.title).push(word.replace(/"/g, '')); continue; }
     if (lower === 'every') { locationWords = null; parts.every = (words[++index] || '').toLowerCase(); continue; }
-    if (lower === 'travel') {
+    if ((lower === 'travel' || lower === 'return') && parseDuration(words[index + 1]) !== null) {
       locationWords = null;
       const minutes = parseDuration(words[index + 1]);
-      if (minutes === null) { parts.travelUnclear = true; continue; }
-      parts.travel = minutes;
+      if (lower === 'travel') parts.travel = minutes; else parts.returnTravel = minutes;
+      index++;
+      continue;
+    }
+    if (lower === 'all' && (words[index + 1] || '').toLowerCase() === 'day') {
+      locationWords = null;
+      parts.allDay = true;
       index++;
       continue;
     }
@@ -210,6 +232,7 @@ function parseParts(text) {
 function parseCommandParts(text) {
   const parts = parseParts(text);
   if (parts.travelUnclear) throw new Error('how long is the travel? e.g. travel 30 (minutes) or travel 1h15');
+  if (parts.returnUnclear) throw new Error('how long is the way back? e.g. return 20 (minutes) or return 1h');
   return parts;
 }
 
@@ -242,18 +265,28 @@ function occursOn(plan, date) {
   }
 }
 
+const isAllDay = plan => +plan.all_day === 1;
+const daysBetween = (fromDate, toDate) => Math.round((toDateObject(toDate) - toDateObject(fromDate)) / 86400000);
+const extraDays = plan => isAllDay(plan) && plan.end_date ? daysBetween(plan.date, plan.end_date) : 0;
+
 function occurrences(fromDate, toDate) {
   const found = [];
   for (const plan of state.data.plans) {
     const exceptions = exceptionsOf(plan);
-    for (let date = fromDate; date <= toDate; date = addDays(date, 1)) {
+    const span = extraDays(plan);
+    const addFrom = (firstDate, details) => {
+      for (let offset = 0; offset <= span; offset++) {
+        const date = addDays(firstDate, offset);
+        if (date < fromDate || date > toDate) continue;
+        found.push({ plan, date, allDay: isAllDay(plan), firstDate, dayNumber: offset + 1, dayCount: span + 1, ...details });
+      }
+    };
+    for (let date = addDays(fromDate, -span); date <= toDate; date = addDays(date, 1)) {
       const changedThatDay = exceptions.some(exception => exception.date === date);
-      if (occursOn(plan, date) && !changedThatDay) found.push({ plan, date, start: plan.start_time, end: plan.end_time });
+      if (occursOn(plan, date) && !changedThatDay) addFrom(date, { start: plan.start_time, end: plan.end_time });
     }
     for (const exception of exceptions) {
-      if (exception.new_date && exception.new_date >= fromDate && exception.new_date <= toDate) {
-        found.push({ plan, date: exception.new_date, start: exception.new_start, end: exception.new_end, movedFrom: exception.date });
-      }
+      if (exception.new_date) addFrom(exception.new_date, { start: exception.new_start, end: exception.new_end, movedFrom: exception.date });
     }
   }
   return found.sort((first, second) => (first.date + first.start).localeCompare(second.date + second.start));
@@ -269,15 +302,35 @@ function upcomingDates(plan, count = 5) {
 }
 
 function describeWhen(plan) {
-  const time = `${plan.start_time}–${plan.end_time}`;
+  const days = extraDays(plan) + 1;
+  const time = isAllDay(plan) ? (days > 1 ? `all day, ${days} days` : 'all day') : `${plan.start_time}–${plan.end_time}`;
   const until = plan.until_date ? ` until ${fullDate(plan.until_date)}` : '';
   switch (plan.repeat_type) {
     case 'weekly':  return `every ${DAY_NAMES[weekdayIndex(plan.date)]} from ${fullDate(plan.date)}${until}, ${time}`;
     case 'monthly': return `every month on the ${ordinal(dayOfMonth(plan.date))} from ${fullDate(plan.date)}${until}, ${time}`;
     case 'yearly':  return `every year on ${shortDate(plan.date)} from ${yearOf(plan.date)}${until}, ${time}`;
-    default:        return `${fullDate(plan.date)}, ${time}`;
+    default:
+      if (days > 1) return `${fullDate(plan.date)} – ${fullDate(plan.end_date)}, all day`;
+      return `${fullDate(plan.date)}, ${time}`;
   }
 }
+
+function noteLines(notes) {
+  return String(notes || '').split('\n').filter(Boolean);
+}
+
+const isChecklistNote = note => /^\[[ x]\] /.test(note);
+
+function toggleNote(notes, noteNumber) {
+  const lines = noteLines(notes);
+  const note = lines[noteNumber - 1];
+  if (note === undefined) throw new Error(`there is no note ${noteNumber}`);
+  if (!isChecklistNote(note)) throw new Error(`note ${noteNumber} is not a checklist item. make one with -- [ ] text`);
+  lines[noteNumber - 1] = note.startsWith('[x] ') ? '[ ] ' + note.slice(4) : '[x] ' + note.slice(4);
+  return lines.join('\n');
+}
+
+const returnHomeAt = (end, returnMinutes) => toTime(Math.min(MINUTES_PER_DAY, toMinutes(end) + returnMinutes));
 
 function frequentTimes() {
   const timesUsed = {};
@@ -297,7 +350,7 @@ async function callServer(action, payload = {}) {
   try {
     const response = await fetch('api.php', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF': APP.csrf },
+      headers: { 'Content-Type': 'application/json', 'X-CSRF': APP.csrf, 'X-Timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || '' },
       body: JSON.stringify({ action, ...payload }),
     });
     answer = await response.json();
@@ -411,59 +464,144 @@ function requireCategoryTag(tag) {
   return category.tag;
 }
 
+
+function safeTypedDate(date) {
+  return parseDate(typedDate(date)) === date ? typedDate(date) : date;
+}
+
+function travelSummary(plan) {
+  const travel = +plan.travel_minutes || 0;
+  const back = +plan.return_minutes || 0;
+  let text = '';
+  if (travel) text += `, ${travelText(travel)} travel (leave at ${leaveAt(plan.start_time, travel)})`;
+  if (back) text += `, ${travelText(back)} back (home at ${returnHomeAt(plan.end_time, back)})`;
+  return text;
+}
+
+function planPreview(plan) {
+  const category = plan.tag ? categoryByTag(plan.tag) : categoryById(plan.category_id);
+  const place = plan.location ? ' @' + plan.location : '';
+  const notes = noteLines(plan.notes).map(note => ' -- ' + note).join('');
+  return `${tagText(category)}${plan.title}, ${describeWhen(plan)}${place}${travelSummary(plan)}${notes}`;
+}
+
+function planFieldsFromParts(parts, commandName) {
+  if (!parts.title) throw new Error(`${commandName} needs a title, e.g. ${commandName} Gym tue 19:00-20:00`);
+  if (parts.allDay) {
+    if (parts.times.length) throw new Error('an all day plan has no time. remove the time or "all day"');
+    if (parts.dates.length > 2) throw new Error('all day takes a first and a last day, e.g. 20-12 03-01 all day');
+  } else {
+    if (!parts.times.length) throw new Error(`${commandName} needs a time, e.g. 19:00-20:00 (or 19:00 for one hour, or all day)`);
+    if (parts.dates.length > 1) throw new Error('several days only work with all day, e.g. add Holiday 20-12 03-01 all day');
+    if (parts.times.length > 1) throw new Error(`${commandName} takes one time`);
+  }
+  const date = parts.dates[0] || today();
+  const lastDate = parts.allDay && parts.dates[1] ? parts.dates[1] : null;
+  if (lastDate && lastDate < date) throw new Error(`the last day (${fullDate(lastDate)}) is before the first day (${fullDate(date)})`);
+
+  const fields = {
+    title: parts.title,
+    tag: requireCategoryTag(parts.tag),
+    location: parts.location || '',
+    notes: parts.notes || '',
+    date,
+    end_date: lastDate && lastDate !== date ? lastDate : null,
+    all_day: parts.allDay ? 1 : 0,
+    start_time: parts.allDay ? '00:00' : parts.times[0][0],
+    end_time: parts.allDay ? '24:00' : parts.times[0][1],
+    repeat_type: 'none',
+    travel_minutes: parts.travel || 0,
+    return_minutes: parts.returnTravel || 0,
+  };
+
+  if (parts.every === null) return [fields];
+  const every = parseEvery(parts.every);
+  if (!every) throw new Error(`"every ${parts.every}" is unclear. try every tue, every sat,sun, every day, every month or every year`);
+  if (every === 'year') return [{ ...fields, repeat_type: 'yearly' }];
+  if (every === 'month') return [{ ...fields, repeat_type: 'monthly' }];
+  const weekdays = every === 'week' ? [weekdayIndex(date)] : every;
+  return weekdays.map(weekday => {
+    const firstDate = nextWeekday(date, weekday);
+    const shift = daysBetween(date, firstDate);
+    return { ...fields, date: firstDate, end_date: fields.end_date && addDays(fields.end_date, shift), repeat_type: 'weekly' };
+  });
+}
+
+function currentPlanFields(plan) {
+  const category = categoryById(plan.category_id);
+  return {
+    title: plan.title, tag: category ? category.tag : null, location: plan.location, notes: plan.notes,
+    date: plan.date, end_date: plan.end_date || null, all_day: +plan.all_day || 0,
+    start_time: plan.start_time, end_time: plan.end_time, repeat_type: plan.repeat_type, until_date: plan.until_date || null,
+    travel_minutes: +plan.travel_minutes || 0, return_minutes: +plan.return_minutes || 0,
+  };
+}
+
+function quoteIfNeeded(text, readsBackAs) {
+  return readsBackAs(text) === text && !NOTE_SEPARATOR.test(` ${text} `) ? text : `"${text.replace(/"/g, '')}"`;
+}
+
+function planAsCommand(plan) {
+  const category = categoryById(plan.category_id);
+  const words = [quoteIfNeeded(plan.title, text => parseParts(text).title), safeTypedDate(plan.date)];
+  if (isAllDay(plan)) {
+    if (plan.end_date) words.push(safeTypedDate(plan.end_date));
+    words.push('all day');
+  } else {
+    words.push(`${plan.start_time}-${plan.end_time}`);
+  }
+  if (category) words.push(`[${category.tag}]`);
+  if (plan.repeat_type === 'weekly') words.push(`every ${DAY_NAMES[weekdayIndex(plan.date)]}`);
+  if (plan.repeat_type === 'monthly') words.push('every month');
+  if (plan.repeat_type === 'yearly') words.push('every year');
+  if (plan.location) {
+    const asTyped = parseParts('@' + plan.location).location === plan.location;
+    words.push(asTyped ? '@' + plan.location : `@ "${plan.location.replace(/"/g, '')}"`);
+  }
+  if (+plan.travel_minutes) words.push(`travel ${plan.travel_minutes}`);
+  if (+plan.return_minutes) words.push(`return ${plan.return_minutes}`);
+  return words.join(' ') + noteLines(plan.notes).map(note => ' -- ' + note).join('');
+}
+
+function prefillInput(text, fullEdit) {
+  ui.input.value = text;
+  state.fullEdit = fullEdit;
+  print('change anything and press Enter. what you remove from the line is removed.', 'dim');
+  ui.input.focus();
+  ui.input.setSelectionRange(text.length, text.length);
+}
+
+function takeFullEdit(kind, id) {
+  const fullEdit = state.activeFullEdit;
+  return Boolean(fullEdit && fullEdit.kind === kind && String(fullEdit.id) === String(id));
+}
+
+async function restoreExceptions(planId, exceptions) {
+  for (const exception of exceptions) {
+    await callServer('exception_restore', { id: planId, date: exception.date, previous: exception });
+  }
+}
+
 const COMMANDS = {};
 
 COMMANDS.add = {
   group: 'agenda', desc: 'add a plan', ex: 'add Gym tue 19:00-20:00 [S]',
-  usage: 'add <title> <day> <time> [tag] every <day> @<place> -- <notes>',
+  usage: 'add <title> <day> <time> [tag] every <day> @<place> travel <min> return <min> -- <note> -- <note>',
   details: [
     'day:    today, tomorrow, tue, 18-11, 18-11-2027 (default: today)',
-    'time:   19:00-20:00, or 19:00 for one hour (required)',
+    'time:   19:00-20:00, or 19:00 for one hour, or all day',
+    'days:   20-12 03-01 all day   (a first and last day, for holidays)',
     'tag:    a category tag in brackets, like [W]',
     'repeat: every tue, every sat,sun (one series per day), every day, every month, every year',
     'place:  @ followed by the place, like @Main St 4',
-    'travel: travel 30 (minutes), travel 1h15. shown above the plan and in its box, with the time to leave',
-    'notes:  everything after --',
+    'travel: travel 30 (minutes there), return 20 (minutes back), like 1h15 or 45',
+    'notes:  every -- starts a new note. start one with - for a bullet, 1. for a number, [ ] for a checklist',
     'put a title in "quotes" if it contains a day name: add "Sunday lunch" sun 13:00',
   ],
   run(args) {
     const parts = parseCommandParts(args);
-    if (!parts.title) throw new Error('add needs a title, e.g. add Gym tue 19:00-20:00');
-    if (!parts.times.length) throw new Error('add needs a time, e.g. 19:00-20:00 (or 19:00 for one hour)');
-    if (parts.times.length > 1 || parts.dates.length > 1) throw new Error('add takes one day and one time');
-    const tag = requireCategoryTag(parts.tag);
-    const date = parts.dates[0] || today();
-
-    let newPlans = [{ date, repeat_type: 'none' }];
-    if (parts.every !== null) {
-      const every = parseEvery(parts.every);
-      if (!every) throw new Error(`"every ${parts.every}" is unclear. try every tue, every sat,sun, every day, every month or every year`);
-      if (every === 'year') newPlans = [{ date, repeat_type: 'yearly' }];
-      else if (every === 'month') newPlans = [{ date, repeat_type: 'monthly' }];
-      else {
-        const weekdays = every === 'week' ? [weekdayIndex(date)] : every;
-        newPlans = weekdays.map(weekday => ({ date: nextWeekday(date, weekday), repeat_type: 'weekly' }));
-      }
-    }
-    newPlans = newPlans.map(plan => ({
-      ...plan,
-      title: parts.title,
-      tag,
-      location: parts.location || '',
-      notes: parts.notes || '',
-      start_time: parts.times[0][0],
-      end_time: parts.times[0][1],
-      travel_minutes: parts.travel || 0,
-    }));
-
-    const preview = newPlans.map(plan => {
-      const place = plan.location ? ' @' + plan.location : '';
-      const travel = plan.travel_minutes ? `, ${travelText(plan.travel_minutes)} travel (leave at ${leaveAt(plan.start_time, plan.travel_minutes)})` : '';
-      const notes = plan.notes ? ' -- ' + plan.notes : '';
-      return `add ${tagText(tag && categoryByTag(tag))}${plan.title}, ${describeWhen(plan)}${place}${travel}${notes}`;
-    });
-
-    confirmThen([...preview, 'save? (y/n)'], async () => {
+    const newPlans = planFieldsFromParts(parts, 'add');
+    confirmThen([...newPlans.map(plan => 'add ' + planPreview(plan)), 'save? (y/n)'], async () => {
       const newIds = [];
       for (const plan of newPlans) newIds.push((await callServer('plan_add', plan)).id);
       rememberUndo(`add ${parts.title}`, `removes ${parts.title} again`, async () => {
@@ -484,6 +622,7 @@ COMMANDS.show = {
     const plan = planById(planIdFrom(args));
     const category = categoryById(plan.category_id);
     const travel = +plan.travel_minutes;
+    const back = +plan.return_minutes;
 
     const block = document.createElement('div');
     block.className = 'block';
@@ -496,7 +635,8 @@ COMMANDS.show = {
     if (category) print(`  type   ${category.name}`);
     if (plan.location) print(`  where  ${plan.location}`);
     if (travel) print(`  travel ${travelText(travel)}, leave at ${leaveAt(plan.start_time, travel)}`);
-    if (plan.notes) print(`  notes  ${plan.notes}`);
+    if (back) print(`  return ${travelText(back)}, home at ${returnHomeAt(plan.end_time, back)}`);
+    noteLines(plan.notes).forEach((note, index) => print(`  note ${index + 1} ${note}`));
     for (const exception of exceptionsOf(plan)) {
       print(exception.new_date
         ? `  moved  ${fullDate(exception.date)} to ${fullDate(exception.new_date)}, ${exception.new_start}–${exception.new_end}`
@@ -507,40 +647,102 @@ COMMANDS.show = {
 };
 
 COMMANDS.edit = {
-  group: 'agenda', desc: 'change part of a plan', ex: 'edit 12 11:00-12:00',
-  usage: 'edit <number> <title / day / time / [tag] / @place / -- notes>',
+  group: 'agenda', desc: 'change a plan', ex: 'edit 12',
+  usage: 'edit <number>   (or: edit <number> <only the parts to change>)',
   details: [
-    'uses the same shorthand as add. only what you type changes.',
+    'edit 12 puts the whole plan in the prompt. change anything and press Enter.',
+    'in that full line, what you remove is removed too (a place, a note, travel...).',
+    'edit 12 11:00-12:00 changes only what you type, using the same shorthand as add.',
     'on a repeating plan this changes every date of the series.',
-    'travel 0 removes the travel time.',
   ],
   run(args) {
     const [idWord, ...rest] = args.split(/\s+/);
     const plan = planById(planIdFrom(idWord));
+    if (!rest.length) return prefillInput(`edit ${plan.id} ${planAsCommand(plan)}`, { kind: 'plan', id: plan.id });
+
     const parts = parseCommandParts(rest.join(' '));
-    const changes = {};
-    const described = [];
+    const before = currentPlanFields(plan);
+    const exceptionsBefore = exceptionsOf(plan).map(exception => ({ ...exception }));
+    let changes;
+    let summary;
 
-    if (parts.title) { changes.title = parts.title; described.push(`title: ${parts.title}`); }
-    if (parts.dates.length) { changes.date = parts.dates[0]; described.push(`date: ${fullDate(parts.dates[0])}`); }
-    if (parts.times.length) { [changes.start_time, changes.end_time] = parts.times[0]; described.push(`time: ${parts.times[0].join('–')}`); }
-    if (parts.tag !== null) { changes.tag = requireCategoryTag(parts.tag); described.push(`category: [${changes.tag}]`); }
-    if (parts.location !== null) { changes.location = parts.location; described.push(`place: ${parts.location || '(none)'}`); }
-    if (parts.notes !== null) { changes.notes = parts.notes; described.push(`notes: ${parts.notes || '(none)'}`); }
-    if (parts.travel !== null) { changes.travel_minutes = parts.travel; described.push(parts.travel ? `travel: ${travelText(parts.travel)}` : 'no travel'); }
-    if (parts.every !== null) throw new Error('edit cannot change how a plan repeats. use stop to end it, then add a new one');
-    if (!described.length) throw new Error('nothing to change, e.g. edit 12 11:00-12:00');
+    if (takeFullEdit('plan', plan.id)) {
+      const replaced = planFieldsFromParts(parts, 'edit');
+      if (replaced.length > 1) throw new Error('one plan can repeat on one day. for more days, add another plan');
+      changes = { ...replaced[0], until_date: before.until_date };
+      summary = planPreview(changes);
+    } else {
+      changes = {};
+      const described = [];
+      if (parts.title) { changes.title = parts.title; described.push(`title: ${parts.title}`); }
+      if (parts.dates.length) { changes.date = parts.dates[0]; described.push(`date: ${fullDate(parts.dates[0])}`); }
+      if (parts.times.length) {
+        [changes.start_time, changes.end_time] = parts.times[0];
+        changes.all_day = 0;
+        changes.end_date = null;
+        described.push(`time: ${parts.times[0].join('–')}`);
+      }
+      if (parts.allDay) { changes.all_day = 1; described.push('all day'); }
+      if (parts.tag !== null) { changes.tag = requireCategoryTag(parts.tag); described.push(`category: [${changes.tag}]`); }
+      if (parts.location !== null) { changes.location = parts.location; described.push(`place: ${parts.location || '(none)'}`); }
+      if (parts.notes !== null) { changes.notes = parts.notes; described.push(`notes: ${noteLines(parts.notes).join(' / ') || '(none)'}`); }
+      if (parts.travel !== null) { changes.travel_minutes = parts.travel; described.push(parts.travel ? `travel: ${travelText(parts.travel)}` : 'no travel'); }
+      if (parts.returnTravel !== null) { changes.return_minutes = parts.returnTravel; described.push(parts.returnTravel ? `return: ${travelText(parts.returnTravel)}` : 'no return travel'); }
+      if (parts.every !== null) throw new Error(`to change how it repeats, type edit ${plan.id} and change the full line`);
+      if (!described.length) throw new Error(`nothing to change. type edit ${plan.id} to get the whole plan in the prompt`);
+      summary = described.join(', ');
+    }
 
-    confirmThen([`edit #${plan.id} ${plan.title}: ${described.join(', ')}`, 'save? (y/n)'], async () => {
-      const oldCategory = categoryById(plan.category_id);
-      const before = {
-        title: plan.title, tag: oldCategory ? oldCategory.tag : null, location: plan.location, notes: plan.notes,
-        date: plan.date, start_time: plan.start_time, end_time: plan.end_time, travel_minutes: +plan.travel_minutes || 0,
-      };
+    confirmThen([`edit #${plan.id}: ${summary}`, 'save? (y/n)'], async () => {
       await callServer('plan_edit', { id: plan.id, fields: changes });
-      rememberUndo(`edit #${plan.id}`, `puts #${plan.id} back as it was`, () => callServer('plan_edit', { id: plan.id, fields: before }));
+      rememberUndo(`edit #${plan.id}`, `puts #${plan.id} back as it was`, async () => {
+        await callServer('plan_edit', { id: plan.id, fields: before });
+        await restoreExceptions(plan.id, exceptionsBefore);
+      });
       printSuccess(`changed #${plan.id}`);
     });
+  },
+};
+
+COMMANDS.copy = {
+  group: 'agenda', desc: 'copy a plan to another day', ex: 'copy 12 fri',
+  usage: 'copy <number> <day> [time]',
+  details: ['the copy happens once, with the same time, place, travel and notes.', 'give a time to change it: copy 12 fri 10:00-11:00'],
+  run(args) {
+    const [idWord, ...rest] = args.split(/\s+/);
+    const plan = planById(planIdFrom(idWord));
+    const parts = parseCommandParts(rest.join(' '));
+    if (!parts.dates.length) throw new Error(`to which day? e.g. copy ${plan.id} fri`);
+    const copy = { ...currentPlanFields(plan), date: parts.dates[0], repeat_type: 'none', until_date: null };
+    if (copy.end_date) copy.end_date = addDays(parts.dates[0], extraDays(plan));
+    if (parts.times.length) {
+      [copy.start_time, copy.end_time] = parts.times[0];
+      copy.all_day = 0;
+      copy.end_date = null;
+    }
+    confirmThen([`copy to: ${planPreview(copy)}`, 'save? (y/n)'], async () => {
+      const { id } = await callServer('plan_add', copy);
+      rememberUndo(`copy #${plan.id}`, 'removes the copy again', () => callServer('plan_rm', { id }));
+      state.cursor = copy.date;
+      render();
+      printSuccess(`copied to #${id} on ${fullDate(copy.date)}`);
+    });
+  },
+};
+
+COMMANDS.tick = {
+  group: 'agenda', desc: 'tick a checklist note on or off', ex: 'tick 12 2', usage: 'tick <number> <note number>',
+  details: ['notes that start with [ ] are a checklist. show 12 lists the note numbers.', 'you can also click the [ ] in the agenda.'],
+  async run(args) {
+    const [idWord, noteWord] = args.split(/\s+/);
+    const plan = planById(planIdFrom(idWord));
+    if (!noteWord) throw new Error(`which note? e.g. tick ${plan.id} 1 (show ${plan.id} lists them)`);
+    const notes = toggleNote(plan.notes, parseInt(noteWord, 10));
+    const before = plan.notes;
+    await callServer('plan_edit', { id: plan.id, fields: { notes } });
+    rememberUndo(`tick ${plan.id} ${noteWord}`, 'sets the note back', () => callServer('plan_edit', { id: plan.id, fields: { notes: before } }));
+    const note = noteLines(notes)[parseInt(noteWord, 10) - 1];
+    printSuccess(note);
   },
 };
 
@@ -719,16 +921,18 @@ COMMANDS.goto = {
 };
 
 COMMANDS.cat = {
-  group: 'categories', desc: 'categories: add, ls, rm', ex: 'cat ls',
-  usage: 'cat add <name> <tag> <border> | cat ls | cat rm <tag>',
+  group: 'categories', desc: 'categories: add, ls, edit, rm', ex: 'cat ls',
+  usage: 'cat add <name> <tag> <border> | cat ls | cat edit <tag> | cat rm <tag>',
   details: [
     'cat add Work W dashed  makes a category shown as [W] with a dashed border',
+    'cat edit W  puts the category in the prompt to change its name, tag or border',
     'borders: solid, dashed, dotted, double, thick',
     'removing a category keeps its plans; they just have no category anymore',
   ],
   sub: {
     add: { desc: 'new category', ex: 'cat add Work W dashed' },
     ls: { desc: 'list categories', ex: 'cat ls' },
+    edit: { desc: 'change name, tag or border', ex: 'cat edit W' },
     rm: { desc: 'remove a category', ex: 'cat rm W' },
   },
   run(args) {
@@ -758,6 +962,26 @@ COMMANDS.cat = {
       return;
     }
 
+    if (subCommand === 'edit') {
+      const category = categoryByTag((rest[0] || '').replace(/[[\]]/g, ''));
+      if (!category) throw new Error('which category? e.g. cat edit W');
+      if (rest.length === 1) return prefillInput(`cat edit ${category.tag} ${category.name} ${category.tag} ${category.border}`, { kind: 'cat', id: category.tag });
+      const values = rest.slice(1);
+      if (values.length < 3) throw new Error(`give a name, tag and border, e.g. cat edit ${category.tag} ${category.name} ${category.tag} double`);
+      const border = values.pop().toLowerCase();
+      const newTag = values.pop().replace(/[[\]]/g, '');
+      const name = values.join(' ');
+      if (!BORDER_STYLES.includes(border)) throw new Error('border must be solid, dashed, dotted, double or thick');
+      confirmThen(`change [${category.tag}] ${category.name} (${category.border}) to [${newTag}] ${name} (${border})? (y/n)`, async () => {
+        const before = { ...category };
+        await callServer('cat_edit', { tag: category.tag, name, new_tag: newTag, border });
+        rememberUndo(`cat edit ${category.tag}`, `changes [${newTag}] back to [${before.tag}] ${before.name}`,
+          () => callServer('cat_edit', { tag: newTag, name: before.name, new_tag: before.tag, border: before.border }));
+        printSuccess(`changed to [${newTag}] ${name}`);
+      });
+      return;
+    }
+
     if (subCommand === 'rm') {
       const category = categoryByTag((rest[0] || '').replace(/[[\]]/g, ''));
       if (!category) throw new Error('which category? e.g. cat rm W');
@@ -774,7 +998,7 @@ COMMANDS.cat = {
       return;
     }
 
-    throw new Error('cat takes add, ls or rm. see help cat');
+    throw new Error('cat takes add, ls, edit or rm. see help cat');
   },
 };
 
@@ -801,21 +1025,31 @@ function takeOutNoDeadline(text) {
   return { found, text: found ? text.replace(phrase, ' ').trim() : text };
 }
 
+function todoAsCommand(todo) {
+  const words = [quoteIfNeeded(todo.title, text => parseParts(takeOutNoDeadline(text).text).title)];
+  words.push(todo.deadline ? safeTypedDate(todo.deadline) : 'no deadline');
+  if (todo.repeat_type && todo.repeat_type !== 'none') words.push(REPEAT_WORDS[todo.repeat_type]);
+  return words.join(' ') + noteLines(todo.notes).map(note => ' -- ' + note).join('');
+}
+
 COMMANDS.todo = {
   group: 'to do', desc: 'open the to do list', ex: 'todo',
-  usage: 'todo | todo add <title> <deadline> [every month] -- <notes> | todo edit <n> ... | todo done <n> | todo plan <n> <day> <time>',
+  usage: 'todo | todo add <title> <deadline> [every month] -- <note> | todo edit <n> | todo done <n> | todo tick <n> <note> | todo plan <n> <day> <time>',
   details: [
     'deadline: today, tomorrow, fri, 18-11, 18-11-2027, or type: no deadline',
     'repeat:   every day, every week, every month, every year (optional)',
     'to dos show up in the agenda on their deadline day.',
-    'edit uses the same shorthand: todo edit 3 fri every month -- new notes (every none stops repeating, no deadline removes it)',
+    'todo edit 3 puts the whole to do in the prompt; what you remove from that line is removed.',
+    'or change only some parts: todo edit 3 fri every month (every none stops repeating, no deadline removes it)',
+    'every -- starts a new note. - bullet, 1. number, [ ] checklist (todo tick 3 1, or click it)',
     'done removes the to do. a repeating one moves on to its next deadline instead.',
     'plan books time for it in the agenda: todo plan 3 fri 14:00-16:00 [W]. the to do stays until done.',
     'undo brings back what you last did, including a done to do.',
   ],
   sub: {
     add: { desc: 'add a to do with a deadline', ex: 'todo add Pay rent 01-12 every month' },
-    edit: { desc: 'change title, deadline, repeat, notes', ex: 'todo edit 3 mon' },
+    edit: { desc: 'change it (the whole line in the prompt)', ex: 'todo edit 3' },
+    tick: { desc: 'tick a checklist note on or off', ex: 'todo tick 3 1' },
     done: { desc: 'finish (removes it)', ex: 'todo done 3' },
     plan: { desc: 'book time for it in the agenda', ex: 'todo plan 3 fri 14:00-16:00' },
   },
@@ -828,8 +1062,9 @@ COMMANDS.todo = {
     if (subCommand === 'edit') return this.edit(rest);
     if (subCommand === 'done') return this.done(rest);
     if (subCommand === 'plan') return this.plan(rest);
+    if (subCommand === 'tick') return this.tick(rest);
     if (subCommand === 'undo') return COMMANDS.undo.run('');
-    throw new Error('todo takes add, edit, done or plan. see help todo');
+    throw new Error('todo takes add, edit, done, tick or plan. see help todo');
   },
 
   add(text) {
@@ -851,7 +1086,7 @@ COMMANDS.todo = {
       notes: parts.notes || '',
       repeat_type: todoRepeatFrom(parts.every) || 'none',
     };
-    const notes = todo.notes ? ' -- ' + todo.notes : '';
+    const notes = noteLines(todo.notes).map(note => ' -- ' + note).join('');
     confirmThen([`todo ${todo.title}, ${dueText(todo.deadline)}${todoRepeatText(todo)}${notes}`, 'save? (y/n)'], async () => {
       const { id } = await callServer('todo_add', todo);
       rememberUndo(`todo add ${todo.title}`, `removes ${todo.title} again`, () => callServer('todo_rm', { id }));
@@ -860,11 +1095,31 @@ COMMANDS.todo = {
   },
 
   edit(text) {
-    const [idWord, ...rest] = text.split(/\s+/);
+    const [idWord, ...rest] = text.split(/\s+/).filter(Boolean);
     const todo = todoById(idWord);
+    if (!rest.length) return prefillInput(`todo edit ${todo.id} ${todoAsCommand(todo)}`, { kind: 'todo', id: todo.id });
     const noDeadline = takeOutNoDeadline(rest.join(' '));
     const parts = parseCommandParts(noDeadline.text);
     if (noDeadline.found && parts.dates.length) throw new Error('give a deadline or type no deadline, not both');
+
+    if (takeFullEdit('todo', todo.id)) {
+      if (!parts.title) throw new Error('a to do needs a title');
+      if (!noDeadline.found && parts.dates.length !== 1) throw new Error('give a deadline, or type: no deadline');
+      if (noDeadline.found && parts.every !== null) throw new Error('a repeating to do needs a deadline');
+      const replaced = {
+        title: parts.title,
+        deadline: noDeadline.found ? null : parts.dates[0],
+        notes: parts.notes || '',
+        repeat_type: todoRepeatFrom(parts.every) || 'none',
+      };
+      const notes = noteLines(replaced.notes).map(note => ' -- ' + note).join('');
+      return confirmThen([`edit to do #${todo.id}: ${replaced.title}, ${dueText(replaced.deadline)}${todoRepeatText(replaced)}${notes}`, 'save? (y/n)'], async () => {
+        const before = { ...todo };
+        await callServer('todo_edit', { id: todo.id, fields: replaced });
+        rememberUndo(`todo edit ${todo.id}`, `puts to do #${todo.id} back as it was`, () => callServer('todo_restore', { todo: before }));
+        printSuccess(`changed to do #${todo.id}`);
+      });
+    }
 
     const changes = {};
     const described = [];
@@ -873,8 +1128,8 @@ COMMANDS.todo = {
     if (noDeadline.found) { changes.deadline = null; described.push('no deadline'); }
     const repeat = todoRepeatFrom(parts.every);
     if (repeat) { changes.repeat_type = repeat; described.push(repeat === 'none' ? 'no longer repeats' : `repeats ${REPEAT_WORDS[repeat]}`); }
-    if (parts.notes !== null) { changes.notes = parts.notes; described.push(`notes: ${parts.notes || '(none)'}`); }
-    if (!described.length) throw new Error(`nothing to change, e.g. todo edit ${todo.id} fri`);
+    if (parts.notes !== null) { changes.notes = parts.notes; described.push(`notes: ${noteLines(parts.notes).join(' / ') || '(none)'}`); }
+    if (!described.length) throw new Error(`nothing to change. type todo edit ${todo.id} to get the whole to do in the prompt`);
 
     confirmThen([`edit to do #${todo.id} ${todo.title}: ${described.join(', ')}`, 'save? (y/n)'], async () => {
       const before = { ...todo };
@@ -882,6 +1137,17 @@ COMMANDS.todo = {
       rememberUndo(`todo edit ${todo.id}`, `puts to do #${todo.id} back as it was`, () => callServer('todo_restore', { todo: before }));
       printSuccess(`changed to do #${todo.id}`);
     });
+  },
+
+  async tick(text) {
+    const [idWord, noteWord] = text.split(/\s+/);
+    const todo = todoById(idWord);
+    if (!noteWord) throw new Error(`which note? e.g. todo tick ${todo.id} 1`);
+    const notes = toggleNote(todo.notes, parseInt(noteWord, 10));
+    const before = { ...todo };
+    await callServer('todo_edit', { id: todo.id, fields: { notes } });
+    rememberUndo(`todo tick ${todo.id} ${noteWord}`, 'sets the note back', () => callServer('todo_restore', { todo: before }));
+    printSuccess(noteLines(notes)[parseInt(noteWord, 10) - 1]);
   },
 
   async done(text) {
@@ -941,11 +1207,11 @@ COMMANDS.bucket = {
     if (subCommand === 'add') {
       const notesStart = rest.search(/(^|\s)--(\s|$)/);
       const title = (notesStart >= 0 ? rest.slice(0, notesStart) : rest).trim();
-      const notes = notesStart >= 0 ? rest.slice(notesStart).replace(/^\s*--\s*/, '').trim() : '';
+      const notes = notesStart >= 0 ? splitNotes(rest.slice(notesStart)) : '';
       if (!title) throw new Error('bucket add needs a title, e.g. bucket add Learn to sail -- since I was a kid');
       const nextNumber = state.data.bucket.length + 1;
       confirmThen([
-        `#${nextNumber} ${title}${notes ? '\n    ' + notes : ''}`,
+        `#${nextNumber} ${title}${noteLines(notes).map(note => '\n    ' + note).join('')}`,
         'this is permanent: it can never be edited or removed. add it? (y/n)',
       ], async () => {
         await callServer('bucket_add', { title, notes });
@@ -974,6 +1240,88 @@ COMMANDS.bucket = {
     }
 
     throw new Error('bucket takes add, done or fail. see help bucket');
+  },
+};
+
+function statsPeriod(text) {
+  const words = text.trim().toLowerCase();
+  const now = state.cursor || today();
+  const week = monday => ({ from: monday, to: addDays(monday, 6), label: `week ${isoWeek(monday)} · ${shortDate(monday)}–${shortDate(addDays(monday, 6))} ${yearOf(addDays(monday, 6))}`, previous: 'last week', shift: from => addDays(from, -7) });
+  const month = first => ({ from: first, to: addDays(addMonths(first, 1), -1), label: `${FULL_MONTH_NAMES[monthOf(first) - 1]} ${yearOf(first)}`, previous: 'last month', shift: from => addMonths(from, -1) });
+  const year = number => ({ from: `${number}-01-01`, to: `${number}-12-31`, label: String(number), previous: 'last year', shift: from => `${yearOf(from) - 1}-01-01` });
+
+  if (!words) return state.view === 'm' ? month(now.slice(0, 8) + '01') : week(mondayOf(now));
+  if (words === 'week') return week(mondayOf(now));
+  if (words === 'month') return month(now.slice(0, 8) + '01');
+  if (words === 'year') return year(yearOf(now));
+  let match = words.match(/^(?:week|wk|w)\s*(\d{1,2})(?:\s+(\d{4}))?$/);
+  if (match) {
+    const number = match[2] ? +match[2] : yearOf(today());
+    const monday = addDays(mondayOf(`${number}-01-04`), (+match[1] - 1) * 7);
+    if (isoWeek(monday) !== +match[1]) throw new Error(`${number} has no week ${match[1]}`);
+    return week(monday);
+  }
+  if ((match = words.match(/^(\d{4})$/))) return year(+match[1]);
+  if ((match = words.match(/^([a-z]{3,})(?:\s+(\d{4}))?$/))) {
+    const monthIndex = FULL_MONTH_NAMES.findIndex(name => name.startsWith(match[1]));
+    if (monthIndex >= 0) return month(`${match[2] || yearOf(today())}-${twoDigits(monthIndex + 1)}-01`);
+  }
+  throw new Error('stats takes week, month, year, week 48, dec, dec 2026 or 2026');
+}
+
+function minutesPerCategory(fromDate, toDate) {
+  const totals = new Map();
+  let travel = 0;
+  for (const occurrence of occurrences(fromDate, toDate)) {
+    if (occurrence.allDay) continue;
+    const key = occurrence.plan.category_id || 'none';
+    totals.set(key, (totals.get(key) || 0) + toMinutes(occurrence.end) - toMinutes(occurrence.start));
+    travel += (+occurrence.plan.travel_minutes || 0) + (+occurrence.plan.return_minutes || 0);
+  }
+  return { totals, travel };
+}
+
+function durationText(minutes) {
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (!hours) return `${rest}m`;
+  return rest ? `${hours}h ${rest}m` : `${hours}h`;
+}
+
+COMMANDS.stats = {
+  group: 'other', desc: 'hours per category, as a chart', ex: 'stats month',
+  usage: 'stats [week | month | year | week 48 | dec | dec 2026 | 2026]',
+  details: ['without a period: the week (or month) on screen.', 'counts repeating plans, skips, moves and travel. all day plans are not counted.'],
+  run(args) {
+    const period = statsPeriod(args);
+    const { totals, travel } = minutesPerCategory(period.from, period.to);
+    const previousFrom = period.shift(period.from);
+    const previousTo = addDays(period.from, -1);
+    const previous = minutesPerCategory(previousFrom, previousTo);
+    const previousTotal = [...previous.totals.values()].reduce((sum, minutes) => sum + minutes, 0) + previous.travel;
+
+    const rows = [...totals.entries()]
+      .map(([key, minutes]) => {
+        const category = key === 'none' ? null : categoryById(key);
+        return { label: category ? `[${category.tag}] ${category.name}` : '(no category)', minutes };
+      })
+      .sort((first, second) => second.minutes - first.minutes);
+    if (travel) rows.push({ label: 'travel', minutes: travel });
+    if (!rows.length) return print(`nothing planned in ${period.label}`, 'dim');
+
+    const total = rows.reduce((sum, row) => sum + row.minutes, 0);
+    const longest = Math.max(...rows.map(row => row.minutes));
+    const labelWidth = Math.max(...rows.map(row => row.label.length), 5) + 2;
+    const barWidth = 24;
+    const lines = [`stats · ${period.label}`, ''];
+    for (const row of rows) {
+      const bar = '█'.repeat(Math.max(1, Math.round(row.minutes / longest * barWidth)));
+      lines.push(`${row.label.padEnd(labelWidth)}${bar.padEnd(barWidth + 1)} ${durationText(row.minutes)}`);
+    }
+    const difference = total - previousTotal;
+    const compared = previousTotal ? `   (${period.previous}: ${durationText(previousTotal)}, ${difference >= 0 ? '+' : '-'}${durationText(Math.abs(difference))})` : '';
+    lines.push('─'.repeat(labelWidth + barWidth + 8), `${'total'.padEnd(labelWidth + barWidth + 2)}${durationText(total)}${compared}`);
+    print(lines.join('\n'), 'pre');
   },
 };
 
@@ -1162,7 +1510,7 @@ async function runLine(line) {
   }
 }
 
-const ALL_COMMAND_NAMES = ['add', 'show', 'edit', 'rm', 'skip', 'move', 'stop', 'view', 'today', 'next', 'prev', 'goto', 'find', 'undo', 'cat', 'todo', 'bucket', 'theme', 'help', 'clear', 'logout'];
+const ALL_COMMAND_NAMES = ['add', 'show', 'edit', 'copy', 'tick', 'rm', 'skip', 'move', 'stop', 'view', 'today', 'next', 'prev', 'goto', 'find', 'stats', 'undo', 'cat', 'todo', 'bucket', 'theme', 'help', 'clear', 'logout'];
 const RUN_NOW = '✓ done';
 
 const chip = (label, insert = label, extra = {}) => ({ label, insert, ...extra });
@@ -1205,6 +1553,9 @@ function suggestionsFor(typedText) {
     case 'edit': return planShorthandChips(commandName, finished, allWords);
     case 'show':
     case 'rm': return finished.length ? [] : planChips(false);
+    case 'copy': return copyChips(finished);
+    case 'tick': return tickChips(finished);
+    case 'stats': return finished.length ? [] : ['week', 'month', 'year', FULL_MONTH_NAMES[monthOf(today()) - 1]].map(name => chip(name, name, { run: true }));
     case 'skip':
     case 'move':
     case 'stop': return seriesChips(commandName, finished);
@@ -1230,14 +1581,32 @@ function suggestionsFor(typedText) {
   }
 }
 
+function copyChips(finished) {
+  if (!finished.length) return planChips(false);
+  if (finished.length === 1) return dateChips();
+  if (finished.length === 2) return [runNowChip(), ...timeChips()];
+  return [];
+}
+
+function tickChips(finished) {
+  const withChecklist = planChips(false).filter(option => noteLines(planById(option.insert).notes).some(isChecklistNote));
+  if (!finished.length) return withChecklist;
+  const plan = planById(finished[0]);
+  if (!plan || finished.length > 1) return [];
+  return noteLines(plan.notes)
+    .map((note, index) => ({ note, number: index + 1 }))
+    .filter(({ note }) => isChecklistNote(note))
+    .map(({ note, number }) => chip(`${number} ${note}`, String(number), { run: true }));
+}
+
 function planShorthandChips(commandName, finished, allWords) {
-  if (commandName === 'edit' && !finished.length) return planChips(false);
+  if (commandName === 'edit' && !finished.length) return planChips(false).map(option => ({ ...option, run: true }));
   const parts = parseParts(allWords.slice(commandName === 'edit' ? 1 : 0).join(' '));
   if (commandName === 'add' && !parts.title) return [chip('type a title…', '', { hint: true })];
 
   const chips = [];
   if (!parts.dates.length) chips.push(...dateChips());
-  if (!parts.times.length) chips.push(...timeChips());
+  if (!parts.times.length && !parts.allDay) chips.push(...timeChips(), chip('all day'));
   if (parts.tag === null) chips.push(...categoryChips());
   if (commandName === 'add' && parts.every === null) {
     const weekday = DAY_NAMES[weekdayIndex(parts.dates[0] || today())];
@@ -1247,9 +1616,12 @@ function planShorthandChips(commandName, finished, allWords) {
   if (parts.travel === null && (parts.location !== null || commandName === 'edit')) {
     chips.push(...[15, 30, 45].map(minutes => chip(`travel ${minutes}`)));
   }
+  if (parts.travel !== null && parts.returnTravel === null) {
+    chips.push(...[parts.travel, 15, 30].filter((minutes, index, all) => minutes && all.indexOf(minutes) === index).map(minutes => chip(`return ${minutes}`)));
+  }
   if (parts.notes === null) chips.push(chip('-- note', '--'));
 
-  const readyToRun = commandName === 'add' ? parts.title && parts.times.length : allWords.length > 1;
+  const readyToRun = commandName === 'add' ? parts.title && (parts.times.length || parts.allDay) : allWords.length > 1;
   if (readyToRun) chips.unshift(runNowChip());
   return chips;
 }
@@ -1269,7 +1641,10 @@ function seriesChips(commandName, finished) {
 }
 
 function categoryCommandChips(finished) {
-  if (!finished.length) return ['add', 'ls', 'rm'].map(name => chip(name));
+  if (!finished.length) return ['add', 'ls', 'edit', 'rm'].map(name => chip(name));
+  if (finished[0] === 'edit' && finished.length === 1) {
+    return state.data.categories.map(category => chip(`[${category.tag}] ${category.name}`, category.tag, { run: true }));
+  }
   if (finished[0] === 'rm' && finished.length === 1) {
     return state.data.categories.map(category => chip(`[${category.tag}] ${category.name}`, category.tag, { run: true }));
   }
@@ -1280,9 +1655,18 @@ function categoryCommandChips(finished) {
 function todoCommandChips(finished, allWords) {
   const todoPicks = state.data.todos.map(todo => chip(`#${todo.id} ${todo.title}`, String(todo.id)));
   const [subCommand] = finished;
-  if (!subCommand) return ['add', 'edit', 'done', 'plan'].map(name => chip(name));
-  if (subCommand === 'done' && finished.length === 1) return todoPicks.map(pick => ({ ...pick, run: true }));
-  if ((subCommand === 'edit' || subCommand === 'plan') && finished.length === 1) return todoPicks;
+  if (!subCommand) return ['add', 'edit', 'done', 'tick', 'plan'].map(name => chip(name));
+  if ((subCommand === 'done' || subCommand === 'edit') && finished.length === 1) return todoPicks.map(pick => ({ ...pick, run: true }));
+  if (subCommand === 'plan' && finished.length === 1) return todoPicks;
+  if (subCommand === 'tick') {
+    if (finished.length === 1) return todoPicks.filter(pick => noteLines(todoById(pick.insert).notes).some(isChecklistNote));
+    const todo = state.data.todos.find(item => item.id == finished[1]);
+    if (!todo || finished.length > 2) return [];
+    return noteLines(todo.notes)
+      .map((note, index) => ({ note, number: index + 1 }))
+      .filter(({ note }) => isChecklistNote(note))
+      .map(({ note, number }) => chip(`${number} ${note}`, String(number), { run: true }));
+  }
 
   if (subCommand === 'plan') {
     const parts = parseParts(allWords.slice(2).join(' '));
@@ -1385,10 +1769,13 @@ function refreshPrompt() {
 async function submitInput() {
   const typedText = ui.input.value;
   ui.input.value = '';
+  state.activeFullEdit = state.fullEdit;
+  state.fullEdit = null;
   markAnswerStart();
   try {
     await handleInput(typedText);
   } finally {
+    state.activeFullEdit = null;
     scrollToAnswer();
     refreshPrompt();
   }
@@ -1459,6 +1846,7 @@ ui.input.addEventListener('keydown', event => {
     refreshPrompt();
   }
   else if (event.key === 'Escape') {
+    state.fullEdit = null;
     if (state.pendingConfirm) {
       state.pendingConfirm = null;
       print('cancelled', 'dim');
@@ -1551,9 +1939,9 @@ function wrapTitle(title, width, maxLines) {
   return kept;
 }
 
-function flowText(parts, widthAt, rowCount) {
+function flowText(parts, widthAt, rowCount, fullWidth = Infinity) {
   const rows = [];
-  for (const [partNumber, [text, style]] of parts.entries()) {
+  for (const [partNumber, [text, style, extra]] of parts.entries()) {
     const words = String(text).split(/[ \t\n]+/).filter(Boolean);
     while (words.length) {
       while (rows.length < rowCount && widthAt(rows.length) < 4) rows.push(null);
@@ -1570,6 +1958,10 @@ function flowText(parts, widthAt, rowCount) {
           words.splice(0, 1, ...word.split('\u00a0'));
           continue;
         }
+        if (!line && word.length > width && word.length <= fullWidth && width < fullWidth && rows.length < rowCount - 1) {
+          line = null;
+          break;
+        }
         if (!line && word.length > width) {
           line = word.slice(0, width);
           words[0] = word.slice(width);
@@ -1579,10 +1971,39 @@ function flowText(parts, widthAt, rowCount) {
         line = line ? `${line} ${word}` : word;
         words.shift();
       }
-      rows.push({ text: line, style, width, part: partNumber });
+      rows.push(line === null ? null : { text: line, style, width, part: partNumber, extra });
     }
   }
   return rows;
+}
+
+const MINUTES_PER_LINE = 5;
+const glue = text => text.replace(/ /g, '\u00a0');
+const leaveText = (start, travel) => `${glue(`→ leave ${leaveAt(start, travel)}`)} · ${glue(`${travelText(travel)} travel`)}`;
+const homeText = (end, back) => `${glue(`← home ${returnHomeAt(end, back)}`)} · ${glue(`${travelText(back)} back`)}`;
+
+function noteParts(plan, kind) {
+  return noteLines(plan.notes).map((note, index) => {
+    const checkbox = note.match(/^\[([ x])\] (.*)$/);
+    const text = checkbox ? `[${checkbox[1] === 'x' ? 'x' : '\u00a0'}] ${checkbox[2]}` : note;
+    return [text, checkbox ? (checkbox[1] === 'x' ? 'ticked' : 'tick') : 'note', { kind, id: plan.id, number: index + 1 }];
+  });
+}
+
+function renderFlowedLine(line, previousPart) {
+  if (!line) return '';
+  if (line.style === 'b') return `<b>${escapeHtml(line.text)}</b>`;
+  if (line.style === 'tick' || line.style === 'ticked') {
+    const firstLine = line.part !== previousPart;
+    const done = line.style === 'ticked' ? ' ticked' : '';
+    if (firstLine && /^\[.\]/.test(line.text)) {
+      const { kind, id, number } = line.extra;
+      return `<span class="note${done}"><span class="tick" data-tick-kind="${kind}" data-tick-id="${id}" data-tick-note="${number}">${escapeHtml(line.text.slice(0, 3))}</span>${escapeHtml(line.text.slice(3))}</span>`;
+    }
+    return `<span class="note${done}">${escapeHtml(line.text)}</span>`;
+  }
+  if (line.style === 'note') return `<span class="note">${escapeHtml(line.text)}</span>`;
+  return `<span class="dim">${escapeHtml(line.text)}</span>`;
 }
 
 function planBox(occurrence, style, widthInChars, coveredBy = []) {
@@ -1592,7 +2013,8 @@ function planBox(occurrence, style, widthInChars, coveredBy = []) {
   const label = `#${plan.id}${category ? ` [${category.tag}]` : ''}`;
   const time = `${start}–${end}${occurrence.movedFrom ? ' (moved)' : ''}`;
   const travel = +plan.travel_minutes || 0;
-  const lineCount = Math.max(1, Math.floor((toMinutes(end) - toMinutes(start)) / 15));
+  const back = +plan.return_minutes || 0;
+  const lineCount = Math.max(1, Math.floor((toMinutes(end) - toMinutes(start)) / MINUTES_PER_LINE));
   const open = (extraClass = '') => `<div class="ev${extraClass}" style="${style}" data-id="${plan.id}" title="${escapeHtml(plan.title)}, ${time}">`;
   const row = (content, withRightSide) =>
     `<div class="row"><span class="side">${vertical}</span><span class="txt">${content}</span>${withRightSide ? `<span class="side">${vertical}</span>` : ''}</div>`;
@@ -1607,6 +2029,7 @@ function planBox(occurrence, style, widthInChars, coveredBy = []) {
       dim(start),
     ];
     if (travel) rows.push(dim('→' + leaveAt(start, travel)));
+    if (back) rows.push(dim('←' + returnHomeAt(end, back)));
     while (rows.length < lineCount) rows.push('');
     return open(' slim') + rows.slice(0, lineCount).map(content => row(content)).join('') + '</div>';
   }
@@ -1620,22 +2043,25 @@ function planBox(occurrence, style, widthInChars, coveredBy = []) {
   const innerWidth = Math.max(4, Math.floor(widthInChars) - 4);
   const startMinutes = toMinutes(start);
   const widthAt = rowNumber => {
-    const rowFrom = startMinutes + 15 * (rowNumber + 1);
-    const rowTo = rowFrom + 15;
+    const rowFrom = startMinutes + MINUTES_PER_LINE * (rowNumber + 1);
+    const rowTo = rowFrom + MINUTES_PER_LINE;
     return coveredBy
       .filter(cover => cover.from < rowTo && cover.to > rowFrom)
       .reduce((narrowest, cover) => Math.min(narrowest, cover.width), innerWidth);
   };
-  const glue = text => text.replace(/ /g, '\u00a0');
   const parts = [
     [plan.title, 'b'],
     [time, 'dim'],
-    travel ? [`${glue(`→ leave ${leaveAt(start, travel)}`)} (${glue(`${travelText(travel)} travel`)})`, 'dim'] : null,
+    travel ? [leaveText(start, travel), 'dim'] : null,
+    back ? [homeText(end, back), 'dim'] : null,
     plan.location ? [`@${plan.location}`, 'dim'] : null,
-    plan.notes ? [plan.notes, 'dim'] : null,
+    ...noteParts(plan, 'plan'),
   ].filter(Boolean);
-  const rows = flowText(parts, widthAt, innerRows)
-    .map(line => !line ? '' : line.style === 'b' ? bold(line.text) : dim(line.text));
+  const lines = flowText(parts, widthAt, innerRows, innerWidth);
+  const rows = lines.map((line, index) => {
+    const previous = lines.slice(0, index).filter(Boolean).pop();
+    return renderFlowedLine(line, previous ? previous.part : -1);
+  });
 
   return open() +
     `<div class="row edge"><span>${topLeft}${horizontal} </span><span class="lbl">${escapeHtml(label)}</span><span class="fill"> ${lineOf(horizontal)}</span><span>${topRight}</span></div>` +
@@ -1644,13 +2070,22 @@ function planBox(occurrence, style, widthInChars, coveredBy = []) {
     `<div class="row edge"><span>${bottomLeft}</span><span class="fill">${lineOf(horizontal)}</span><span>${bottomRight}</span></div></div>`;
 }
 
-function travelTrail(occurrence, style) {
-  const lineCount = Math.max(1, Math.floor(occurrence.travel / 15));
-  const firstLine = `<span class="dim">→ ${escapeHtml(travelText(occurrence.travel))} travel, leave ${leaveAt(occurrence.start, occurrence.travel)}</span>`;
-  const rows = [firstLine, ...Array(lineCount - 1).fill('')]
-    .map(content => `<div class="row"><span class="side">┊</span><span class="txt">${content}</span></div>`);
-  const destination = occurrence.plan.location || occurrence.plan.title;
-  return `<div class="ev travel" style="${style}" data-id="${occurrence.plan.id}" title="travel to ${escapeHtml(destination)}">${rows.join('')}</div>`;
+function travelTrail(occurrence, style, widthInChars, minutes, text, extraClass) {
+  const lineCount = Math.max(1, Math.floor(minutes / MINUTES_PER_LINE));
+  const width = Math.max(4, Math.floor(widthInChars) - 3);
+  const lines = flowText([[text, 'dim']], () => width, lineCount).filter(Boolean).map(line => line.text);
+  const rows = Array.from({ length: lineCount }, (_, index) => lines[index] || '')
+    .map(content => `<div class="row"><span class="side">┊</span><span class="txt"><span class="dim">${escapeHtml(content)}</span></span></div>`);
+  const place = occurrence.plan.location || occurrence.plan.title;
+  return `<div class="ev travel${extraClass}" style="${style}" data-id="${occurrence.plan.id}" title="${escapeHtml(place)}">${rows.join('')}</div>`;
+}
+
+function allDayLines(date, dayOccurrences) {
+  return dayOccurrences.filter(occurrence => occurrence.allDay).map(({ plan, dayNumber, dayCount }) => {
+    const days = dayCount > 1 ? ` <span class="dim">${dayNumber}/${dayCount}</span>` : '';
+    const mark = dayCount > 1 && dayNumber > 1 ? '▸' : '■';
+    return `<div class="allday-line" data-id="${plan.id}" title="${escapeHtml(plan.title)}, ${escapeHtml(describeWhen(plan))}">${mark} ${escapeHtml(plan.title)}${days}</div>`;
+  }).join('');
 }
 
 function todoLines(date, maxShown = 3) {
@@ -1667,12 +2102,12 @@ function todoLines(date, maxShown = 3) {
 function stackPlans(dayPlans, columnChars) {
   dayPlans.sort((first, second) =>
     first.fromMinutes - second.fromMinutes ||
-    (second.endMinutes - second.fromMinutes) - (first.endMinutes - first.fromMinutes));
+    (second.untilMinutes - second.fromMinutes) - (first.untilMinutes - first.fromMinutes));
 
   const normalShift = Math.min(3, columnChars * 0.18);
   const placed = [];
   for (const current of dayPlans) {
-    const below = placed.filter(other => other.endMinutes > current.fromMinutes).pop();
+    const below = placed.filter(other => other.untilMinutes > current.fromMinutes).pop();
     current.level = below ? below.level + 1 : 0;
     current.leftChars = 0;
     current.coveredBy = [];
@@ -1680,12 +2115,12 @@ function stackPlans(dayPlans, columnChars) {
     if (below) {
       const titleWidth = Math.min(below.plan.title.length, Math.floor(columnChars - below.leftChars) - 4);
       const landsOnTitle = current.fromMinutes < below.startMinutes + 30;
-      const shift = landsOnTitle ? Math.min(titleWidth + 5, (columnChars - below.leftChars) / 2) : normalShift;
+      const shift = landsOnTitle ? Math.min(Math.max(titleWidth + 5, 20), (columnChars - below.leftChars) / 2) : normalShift;
       current.leftChars = Math.min(below.leftChars + shift, columnChars * 0.6);
     }
     for (const other of placed) {
-      if (other.endMinutes > current.fromMinutes && other.level < current.level) {
-        other.coveredBy.push({ from: current.fromMinutes, to: current.endMinutes, width: Math.floor(current.leftChars - other.leftChars) - 3 });
+      if (other.untilMinutes > current.fromMinutes && other.level < current.level) {
+        other.coveredBy.push({ from: current.fromMinutes, to: current.untilMinutes, width: Math.floor(current.leftChars - other.leftChars) - 3 });
       }
     }
     placed.push(current);
@@ -1709,16 +2144,25 @@ function renderGrid() {
   for (const date of days) {
     const monthName = days.length === 1 ? ' ' + MONTH_NAMES[monthOf(date) - 1] : '';
     html += `<div class="dh${date === now ? ' today' : ''}"><div class="dh-line"><span class="pre">── </span>` +
-      `<span class="lbl">${DAY_NAMES[weekdayIndex(date)]} ${dayOfMonth(date)}${monthName}</span><span class="fill"> ${lineOf('─')}</span></div>${todoLines(date)}</div>`;
+      `<span class="lbl">${DAY_NAMES[weekdayIndex(date)]} ${dayOfMonth(date)}${monthName}</span><span class="fill"> ${lineOf('─')}</span></div>` +
+      `${allDayLines(date, allOccurrences.filter(occurrence => occurrence.date === date))}${todoLines(date)}</div>`;
   }
 
-  html += `<div class="hours">${Array.from({ length: 24 }, (_, hour) => `<div>${twoDigits(hour)}:00 ┤</div>`).join('')}</div>`;
+  const quarterMarks = ['15', '30', '45'].map(minute => `<span class="quarter">:${minute} ┤</span>`).join('');
+  const nowInGutter = days.includes(now) ? `<span class="now-time" style="top:${percentOfDay(nowMinutes)}%"><b>${currentTime()}</b></span>` : '';
+  html += `<div class="hours">${Array.from({ length: 24 }, (_, hour) => `<div><span class="hour">${twoDigits(hour)}:00 ┤</span>${quarterMarks}</div>`).join('')}${nowInGutter}</div>`;
 
   for (const date of days) {
-    const dayPlans = allOccurrences.filter(occurrence => occurrence.date === date).map(occurrence => {
+    const dayPlans = allOccurrences.filter(occurrence => occurrence.date === date && !occurrence.allDay).map(occurrence => {
       const startMinutes = toMinutes(occurrence.start);
+      const endMinutes = toMinutes(occurrence.end);
       const travel = +occurrence.plan.travel_minutes || 0;
-      return { ...occurrence, travel, startMinutes, endMinutes: toMinutes(occurrence.end), fromMinutes: Math.max(0, startMinutes - travel) };
+      const back = +occurrence.plan.return_minutes || 0;
+      return {
+        ...occurrence, travel, back, startMinutes, endMinutes,
+        fromMinutes: Math.max(0, startMinutes - travel),
+        untilMinutes: Math.min(MINUTES_PER_DAY, endMinutes + back),
+      };
     });
     stackPlans(dayPlans, columnChars);
 
@@ -1726,15 +2170,21 @@ function renderGrid() {
     for (const item of dayPlans) {
       const left = item.leftChars.toFixed(1);
       const horizontal = `left:${left}ch;width:calc(100% - ${left}ch);z-index:${1 + item.level}`;
+      const paper = item.level ? ';background:var(--white)' : '';
+      const widthInChars = columnChars - item.leftChars;
       if (item.travel && item.startMinutes > item.fromMinutes) {
-        const paper = item.level ? ';background:var(--paper)' : '';
-        html += travelTrail(item, `top:${percentOfDay(item.fromMinutes)}%;height:${percentOfDay(item.startMinutes - item.fromMinutes)}%;${horizontal}${paper}`);
+        html += travelTrail(item, `top:${percentOfDay(item.fromMinutes)}%;height:${percentOfDay(item.startMinutes - item.fromMinutes)}%;${horizontal}${paper}`,
+          widthInChars, item.startMinutes - item.fromMinutes, leaveText(item.start, item.travel), '');
+      }
+      if (item.back && item.untilMinutes > item.endMinutes) {
+        html += travelTrail(item, `top:${percentOfDay(item.endMinutes)}%;height:${percentOfDay(item.untilMinutes - item.endMinutes)}%;${horizontal}${paper}`,
+          widthInChars, item.untilMinutes - item.endMinutes, homeText(item.end, item.back), ' back');
       }
       html += planBox(item, `top:${percentOfDay(item.startMinutes)}%;height:${percentOfDay(item.endMinutes - item.startMinutes)}%;${horizontal}`,
         columnChars - item.leftChars, item.coveredBy);
     }
-    if (date === now) {
-      html += `<div class="now" style="top:${percentOfDay(nowMinutes)}%"><span class="lbl">now</span><span class="fill">${lineOf('━')}</span></div>`;
+    if (days.includes(now)) {
+      html += `<div class="now${date === now ? '' : ' elsewhere'}" style="top:${percentOfDay(nowMinutes)}%"></div>`;
     }
     html += '</div>';
   }
@@ -1761,8 +2211,12 @@ function renderMonth() {
     const dayPlans = allOccurrences.filter(occurrence => occurrence.date === date);
     const classes = `cell${date.slice(0, 7) !== shownMonth ? ' other' : ''}${date === now ? ' today' : ''}`;
     html += `<div class="${classes}" data-date="${date}"><span class="num">${dayOfMonth(date)}</span>${todoLines(date, 2)}`;
-    html += dayPlans.slice(0, 4).map(({ plan, start }) => {
+    html += dayPlans.slice(0, 4).map(({ plan, start, allDay, dayNumber, dayCount }) => {
       const category = categoryById(plan.category_id);
+      if (allDay) {
+        const mark = dayCount > 1 && dayNumber > 1 ? '▸' : '■';
+        return `<div class="m-item allday"><span class="side">${mark}</span><span class="title">${escapeHtml(plan.title)}</span></div>`;
+      }
       const side = BOX_CHARACTERS[category ? category.border : 'solid'][5];
       const tag = category ? `[${escapeHtml(category.tag)}]` : `#${plan.id}`;
       return `<div class="m-item"><span class="side">${side}</span><span class="time">${start} </span><span class="tag">${tag}</span><span class="title"> ${escapeHtml(plan.title)}</span></div>`;
@@ -1832,7 +2286,12 @@ ${todos.length} open${overdueCount ? `, ${overdueCount} overdue` : ''}</pre>`;
       const repeat = todo.repeat_type && todo.repeat_type !== 'none'
         ? `<span class="rep" title="${REPEAT_WORDS[todo.repeat_type]}">↻ ${todo.repeat_type}</span> ` : '';
       const due = todo.deadline ? `${DAY_NAMES[weekdayIndex(todo.deadline)]} ${escapeHtml(shortDate(todo.deadline))}` : '';
-      const notes = todo.notes ? `<span class="notes">${escapeHtml(todo.notes)}</span>` : '';
+      const notes = todo.notes ? `<span class="notes">${noteLines(todo.notes).map((note, index) => {
+        const checkbox = note.match(/^\[([ x])\] (.*)$/);
+        if (!checkbox) return `<span class="note-line">${escapeHtml(note)}</span>`;
+        const ticked = checkbox[1] === 'x';
+        return `<span class="note-line${ticked ? ' ticked' : ''}"><span class="tick" data-tick-kind="todo" data-tick-id="${todo.id}" data-tick-note="${index + 1}">[${ticked ? 'x' : ' '}]</span> ${escapeHtml(checkbox[2])}</span>`;
+      }).join('')}</span>` : '';
       return `<li><span class="box" data-done="${todo.id}" title="done">[ ]</span><span class="n">#${todo.id}</span>` +
         `<span class="t"><span class="title" data-edit="${todo.id}">${escapeHtml(todo.title)}</span>${notes}</span>` +
         `<span class="due">${repeat}${due}</span>` +
@@ -1859,7 +2318,19 @@ function render() {
   renderStatus();
 }
 
+function runFromClick(line) {
+  markAnswerStart();
+  runLine(line).then(() => { scrollToAnswer(); refreshPrompt(); });
+}
+
 ui.view.addEventListener('click', event => {
+  const tickBox = event.target.closest('[data-tick-kind]');
+  if (tickBox) {
+    const { tickKind, tickId, tickNote } = tickBox.dataset;
+    runFromClick(tickKind === 'todo' ? `todo tick ${tickId} ${tickNote}` : `tick ${tickId} ${tickNote}`);
+    return;
+  }
+
   const doneButton = event.target.closest('[data-done]');
   if (doneButton) {
     markAnswerStart();
@@ -1869,9 +2340,13 @@ ui.view.addEventListener('click', event => {
 
   const todoTitle = event.target.closest('[data-edit]');
   if (todoTitle) {
-    ui.input.value = `todo edit ${todoTitle.dataset.edit} `;
-    ui.input.focus();
-    refreshPrompt();
+    runFromClick(`todo edit ${todoTitle.dataset.edit}`);
+    return;
+  }
+
+  const allDayLine = event.target.closest('.allday-line');
+  if (allDayLine) {
+    runLine(`show ${allDayLine.dataset.id}`);
     return;
   }
 
@@ -1896,13 +2371,20 @@ ui.view.addEventListener('click', event => {
   const dayColumn = event.target.closest('.col');
   if (dayColumn) {
     const column = dayColumn.getBoundingClientRect();
-    const hour = Math.min(23, Math.floor((event.clientY - column.top) / column.height * 24));
-    const endHour = hour === 23 ? '24' : twoDigits(hour + 1);
-    ui.input.value = `add  ${typedDate(dayColumn.dataset.date)} ${twoDigits(hour)}:00-${endHour}:00`;
+    const clicked = (event.clientY - column.top) / column.height * MINUTES_PER_DAY;
+    const startMinutes = Math.min(MINUTES_PER_DAY - 5, Math.max(0, Math.floor(clicked / 5) * 5));
+    const endMinutes = Math.min(MINUTES_PER_DAY, startMinutes + 60);
+    const endTime = endMinutes === MINUTES_PER_DAY ? '24:00' : toTime(endMinutes);
+    ui.input.value = `add  ${typedDate(dayColumn.dataset.date)} ${toTime(startMinutes)}-${endTime}`;
     ui.input.focus();
     ui.input.setSelectionRange(4, 4);
     refreshPrompt();
   }
+});
+
+ui.view.addEventListener('dblclick', event => {
+  const planElement = event.target.closest('.ev, .allday-line');
+  if (planElement) runFromClick(`edit ${planElement.dataset.id}`);
 });
 
 state.cursor = today();
@@ -1910,14 +2392,17 @@ render();
 refreshPrompt();
 if (matchMedia('(pointer: fine)').matches) ui.input.focus();
 
-setInterval(() => {
+function everyMinute() {
   const scrollPosition = ui.view.scrollTop;
   if (APP.loggedIn && !isListView() && state.view !== 'm') {
     renderGrid();
     ui.view.scrollTop = scrollPosition;
   }
   renderStatus();
-}, 60000);
+  setTimeout(everyMinute, 60000 - Date.now() % 60000 + 50);
+}
+setTimeout(everyMinute, 60000 - Date.now() % 60000 + 50);
+addEventListener('visibilitychange', () => { if (!document.hidden) { renderStatus(); if (APP.loggedIn && !isListView() && state.view !== 'm') renderGrid(); } });
 
 let resizeTimer;
 addEventListener('resize', () => {

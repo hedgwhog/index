@@ -3,6 +3,7 @@ declare(strict_types=1);
 require __DIR__ . '/lib.php';
 
 header('Content-Type: application/json');
+use_device_timezone();
 
 function reply(array $data, int $code = 200): never
 {
@@ -16,10 +17,10 @@ function state(): array
     $db = db();
     return [
         'categories' => $db->query('SELECT * FROM categories ORDER BY name')->fetchAll(),
-        'plans'      => $db->query('SELECT * FROM plans ORDER BY date, start_time')->fetchAll(),
+        'plans' => $db->query('SELECT * FROM plans ORDER BY date, start_time')->fetchAll(),
         'exceptions' => $db->query('SELECT * FROM plan_exceptions')->fetchAll(),
-        'bucket'     => $db->query('SELECT * FROM bucket ORDER BY id')->fetchAll(),
-        'todos'      => $db->query('SELECT * FROM todos ORDER BY deadline IS NULL, deadline, id')->fetchAll(),
+        'bucket' => $db->query('SELECT * FROM bucket ORDER BY id')->fetchAll(),
+        'todos' => $db->query('SELECT * FROM todos ORDER BY deadline IS NULL, deadline, id')->fetchAll(),
     ];
 }
 
@@ -68,6 +69,75 @@ function save_exception(int $planId, $date, array $e): void
     db()->prepare('INSERT OR REPLACE INTO plan_exceptions (plan_id, date, new_date, new_start, new_end) VALUES (?, ?, ?, ?, ?)')->execute([$planId, $date, ...$new]);
 }
 
+function plan_values(array $in, array $current = []): array
+{
+    $value = fn(string $key, $default = null) => array_key_exists($key, $in) ? $in[$key] : ($current[$key] ?? $default);
+
+    $allDay = (bool)$value('all_day', 0);
+    $date = check_date($value('date'));
+    $endDate = $value('end_date');
+    $endDate = $endDate === null || $endDate === '' ? null : check_date($endDate);
+    if ($endDate !== null && !$allDay) throw new BadInput('only all day plans can last several days');
+    if ($endDate !== null && $endDate < $date) throw new BadInput('the last day is before the first day');
+    if ($endDate === $date) $endDate = null;
+
+    if ($allDay) {
+        [$start, $end] = ['00:00', '24:00'];
+    } else {
+        $start = check_time($value('start_time'));
+        $end = check_time($value('end_time'));
+        check_times($start, $end);
+    }
+
+    if (array_key_exists('tag', $in)) {
+        $categoryId = category_id($in['tag']);
+    } else {
+        $categoryId = $value('category_id');
+        if ($categoryId !== null && !category_exists((int)$categoryId)) $categoryId = null;   // removed meanwhile
+    }
+
+    $until = $value('until_date');
+    return [
+        'title' => check_text($value('title', ''), 100, true),
+        'category_id' => $categoryId === null ? null : (int)$categoryId,
+        'location' => check_text($value('location', ''), 100),
+        'notes' => check_notes($value('notes', '')),
+        'date' => $date,
+        'end_date' => $endDate,
+        'all_day' => $allDay ? 1 : 0,
+        'start_time' => $start,
+        'end_time' => $end,
+        'repeat_type' => check_repeat($value('repeat_type', 'none'), PLAN_REPEATS),
+        'until_date' => $until === null || $until === '' ? null : check_date($until),
+        'travel_minutes' => check_travel($value('travel_minutes', 0)),
+        'return_minutes' => check_travel($value('return_minutes', 0)),
+    ];
+}
+
+function category_exists(int $id): bool
+{
+    $st = db()->prepare('SELECT 1 FROM categories WHERE id = ?');
+    $st->execute([$id]);
+    return $st->fetchColumn() !== false;
+}
+
+function save_plan(array $values, ?int $updateId = null, ?int $restoreId = null): int
+{
+    $columns = array_keys($values);
+    if ($updateId !== null) {
+        $set = implode(', ', array_map(fn($column) => "$column = ?", $columns));
+        db()->prepare("UPDATE plans SET $set WHERE id = ?")->execute([...array_values($values), $updateId]);
+        return $updateId;
+    }
+    if ($restoreId !== null) {
+        $columns[] = 'id';
+        $values['id'] = $restoreId;
+    }
+    $placeholders = implode(', ', array_fill(0, count($columns), '?'));
+    db()->prepare('INSERT INTO plans (' . implode(', ', $columns) . ") VALUES ($placeholders)")->execute(array_values($values));
+    return $restoreId ?? (int)db()->lastInsertId();
+}
+
 function check_times(string $start, string $end): void
 {
     if ($end <= $start) throw new BadInput('end time must be after start time');
@@ -92,7 +162,7 @@ try {
         $ok = hash_equals($user['username'], (string)($in['username'] ?? '')) && password_verify((string)($in['password'] ?? ''), $user['password_hash']);
         if (!$ok) {
             $failed = $user['failed_logins'] + 1;
-            $lock = $failed >= 5 ? time() + 300 : 0;   // 5 wrong tries = 5 minutes locked
+            $lock = $failed >= 5 ? time() + 300 : 0; // 5 wrong tries = 5 minutes locked
             $db->prepare('UPDATE user SET failed_logins = ?, locked_until = ? WHERE id = ?')
                ->execute([$lock ? 0 : $failed, $lock, $user['id']]);
             reply(['error' => 'login incorrect'], 401);
@@ -119,86 +189,35 @@ try {
 
         // plans
         case 'plan_add':
-            $repeat = check_repeat($in['repeat_type'] ?? 'none', PLAN_REPEATS);
-            $start = check_time($in['start_time'] ?? null);
-            $end = check_time($in['end_time'] ?? null);
-            check_times($start, $end);
-            $db->prepare('INSERT INTO plans (title, category_id, location, notes, date, start_time, end_time, repeat_type, travel_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-               ->execute([
-                   check_text($in['title'] ?? '', 100, true),
-                   category_id($in['tag'] ?? null),
-                   check_text($in['location'] ?? '', 100),
-                   check_text($in['notes'] ?? '', 1000),
-                   check_date($in['date'] ?? null),
-                   $start, $end, $repeat,
-                   check_travel($in['travel_minutes'] ?? 0),
-               ]);
-            $result['id'] = (int)$db->lastInsertId();
+            $result['id'] = save_plan(plan_values($in));
             break;
 
-        case 'plan_edit':
-            $p = find_plan((int)($in['id'] ?? 0));
-            $f = $in['fields'] ?? [];
-            if (array_key_exists('title', $f)) 
-                $p['title'] = check_text($f['title'], 100, true);
-
-            if (array_key_exists('tag', $f))      
-                $p['category_id'] = category_id($f['tag']);
-
-            if (array_key_exists('location', $f)) 
-                $p['location'] = check_text($f['location'], 100);
-
-            if (array_key_exists('notes', $f))    
-                $p['notes'] = check_text($f['notes'], 1000);
-
-            if (array_key_exists('date', $f))     
-                $p['date'] = check_date($f['date']);
-
-            if (array_key_exists('until_date', $f)) 
-                $p['until_date'] = $f['until_date'] === null ? null : check_date($f['until_date']);
-
-            if (array_key_exists('travel_minutes', $f)) 
-                $p['travel_minutes'] = check_travel($f['travel_minutes']);
-
-            if (array_key_exists('start_time', $f)) {
-                $p['start_time'] = check_time($f['start_time']);
-                $p['end_time'] = check_time($f['end_time'] ?? null);
+        case 'plan_edit': // only the fields that are sent change
+            $plan = find_plan((int)($in['id'] ?? 0));
+            $values = plan_values($in['fields'] ?? [], $plan);
+            $db->beginTransaction();
+            save_plan($values, $plan['id']);
+            // skipped/moved dates that no longer fit the plan are removed
+            $exceptions = $db->prepare('SELECT date FROM plan_exceptions WHERE plan_id = ?');
+            $exceptions->execute([$plan['id']]);
+            foreach ($exceptions->fetchAll(PDO::FETCH_COLUMN) as $date) {
+                if (!occurs_on($values, $date)) {
+                    $db->prepare('DELETE FROM plan_exceptions WHERE plan_id = ? AND date = ?')->execute([$plan['id'], $date]);
+                }
             }
-            check_times($p['start_time'], $p['end_time']);
-            $db->prepare('UPDATE plans SET title=?, category_id=?, location=?, notes=?, date=?, start_time=?, end_time=?, until_date=?, travel_minutes=? WHERE id=?')->execute([$p['title'], $p['category_id'], $p['location'], $p['notes'], $p['date'], $p['start_time'], $p['end_time'], $p['until_date'], $p['travel_minutes'], $p['id']]);
+            $db->commit();
             break;
 
         case 'plan_rm':
-            $p = find_plan((int)($in['id'] ?? 0));
-            $db->prepare('DELETE FROM plans WHERE id = ?')->execute([$p['id']]);
+            $plan = find_plan((int)($in['id'] ?? 0));
+            $db->prepare('DELETE FROM plans WHERE id = ?')->execute([$plan['id']]);
             break;
 
-        case 'plan_restore'; // undo of rm
-            $p = $in['plan'] ?? [];
-            $start = check_time($p['start_time'] ?? null);
-            $end = check_time($p['end_time'] ?? null);
-            check_times($start, $end);
-            $cat = $p['category_id'] ?? null;
-            if ($cat !== null) {
-                $st = $db->prepare('SELECT id FROM categories WHERE id = ?');
-                $st->execute([(int)$cat]);
-                $cat = $st->fetchColumn() === false ? null : (int)$cat;
-            }
+        case 'plan_restore': // undo of rm
+            $plan = $in['plan'] ?? [];
             $db->beginTransaction();
-            $db->prepare('INSERT INTO plans (id, title, category_id, location, notes, date, start_time, end_time, repeat_type, until_date, travel_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-               ->execute([
-                   (int)($p['id'] ?? 0),
-                   check_text($p['title'] ?? '', 100, true),
-                   $cat,
-                   check_text($p['location'] ?? '', 100),
-                   check_text($p['notes'] ?? '', 1000),
-                   check_date($p['date'] ?? null),
-                   $start, $end,
-                   check_repeat($p['repeat_type'] ?? 'none', PLAN_REPEATS),
-                   ($p['until_date'] ?? null) === null ? null : check_date($p['until_date']),
-                   check_travel($p['travel_minutes'] ?? 0),
-               ]);
-            foreach (($in['exceptions'] ?? []) as $e) save_exception((int)$p['id'], $e['date'] ?? null, $e);
+            save_plan(plan_values($plan), null, (int)($plan['id'] ?? 0));
+            foreach (($in['exceptions'] ?? []) as $exception) save_exception((int)$plan['id'], $exception['date'] ?? null, $exception);
             $db->commit();
             break;
 
@@ -229,7 +248,7 @@ try {
             
         // Categories (tags)
         case 'cat_add':
-        case 'cat_restore':   // undo of cat rm
+        case 'cat_restore': // undo of cat rm
             $c = $action === 'cat_add' ? $in : ($in['category'] ?? []);
             $tag = check_text($c['tag'] ?? '', 3, true);
             if (!preg_match('/^[^\s\[\]]+$/u', $tag)) throw new BadInput('a tag cannot contain spaces or brackets');
@@ -247,6 +266,20 @@ try {
             $set = $db->prepare('UPDATE plans SET category_id = ? WHERE id = ? AND category_id IS NULL');
             foreach (($in['plan_ids'] ?? []) as $pid) $set->execute([$result['id'], (int)$pid]);
             $db->commit();
+            break;
+
+        case 'cat_edit': 
+            $id = category_id($in['tag'] ?? '');
+            $newTag = check_text($in['new_tag'] ?? '', 3, true);
+            if (!preg_match('/^[^\s\[\]]+$/u', $newTag)) throw new BadInput('a tag cannot contain spaces or brackets');
+            $border = $in['border'] ?? '';
+            if (!in_array($border, BORDERS, true)) throw new BadInput('border must be one of: ' . implode(', ', BORDERS));
+            try {
+                $db->prepare('UPDATE categories SET name = ?, tag = ?, border = ? WHERE id = ?')
+                   ->execute([check_text($in['name'] ?? '', 30, true), $newTag, $border, $id]);
+            } catch (PDOException $e) {
+                throw new BadInput("tag [$newTag] is already used");
+            }
             break;
 
         case 'cat_rm':
@@ -268,7 +301,7 @@ try {
                    $action === 'todo_restore' ? (int)($t['id'] ?? 0) : null,
                    check_text($t['title'] ?? '', 100, true),
                    $deadline,
-                   check_text($t['notes'] ?? '', 1000),
+                   check_notes($t['notes'] ?? ''),
                    $repeat,
                    $action === 'todo_restore' ? check_date($t['created'] ?? null) : date('Y-m-d'),
                ]);
@@ -285,7 +318,7 @@ try {
                 $t['deadline'] = $f['deadline'] === null ? null : check_date($f['deadline']);
 
             if (array_key_exists('notes', $f))       
-                $t['notes'] = check_text($f['notes'], 1000);
+                $t['notes'] = check_notes($f['notes']);
 
             if (array_key_exists('repeat_type', $f)) 
                 $t['repeat_type'] = check_repeat($f['repeat_type'], TODO_REPEATS);
@@ -311,7 +344,7 @@ try {
 
         //bucket list
         case 'bucket_add':
-            $db->prepare('INSERT INTO bucket (title, notes, created) VALUES (?, ?, ?)')->execute([check_text($in['title'] ?? '', 100, true), check_text($in['notes'] ?? '', 1000), date('Y-m-d')]);
+            $db->prepare('INSERT INTO bucket (title, notes, created) VALUES (?, ?, ?)')->execute([check_text($in['title'] ?? '', 100, true), check_notes($in['notes'] ?? ''), date('Y-m-d')]);
             break;
 
         case 'bucket_set':
