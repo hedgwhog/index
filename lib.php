@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 // Settings
-date_default_timezone_set('Europe/Stockholm'); // change to your own timezone
+date_default_timezone_set('Europe/Stockholm'); // change to your preffered timezone
 
 const DB_FILE = __DIR__ . '/data/agenda.sqlite';
 const BORDERS = ['solid', 'dashed', 'dotted', 'double', 'thick'];
@@ -74,7 +74,10 @@ function create_tables(PDO $pdo): void
             end_time TEXT NOT NULL,
             repeat_type TEXT NOT NULL DEFAULT 'none',
             until_date TEXT,
-            travel_minutes INTEGER NOT NULL DEFAULT 0
+            travel_minutes INTEGER NOT NULL DEFAULT 0,
+            return_minutes INTEGER NOT NULL DEFAULT 0,
+            all_day INTEGER NOT NULL DEFAULT 0,
+            end_date TEXT
         );
         CREATE TABLE IF NOT EXISTS plan_exceptions (
             id INTEGER PRIMARY KEY,
@@ -111,8 +114,16 @@ function upgrade_old_database(PDO $pdo): void
         $pdo->exec("ALTER TABLE todos ADD COLUMN repeat_type TEXT NOT NULL DEFAULT 'none'");
     }
 
-    if (!table_has_column($pdo, 'plans', 'travel_minutes')) {
-        $pdo->exec('ALTER TABLE plans ADD COLUMN travel_minutes INTEGER NOT NULL DEFAULT 0');
+    $newPlanColumns = [
+        'travel_minutes' => 'INTEGER NOT NULL DEFAULT 0',
+        'return_minutes' => 'INTEGER NOT NULL DEFAULT 0',
+        'all_day' => 'INTEGER NOT NULL DEFAULT 0',
+        'end_date' => 'TEXT',
+    ];
+    foreach ($newPlanColumns as $column => $definition) {
+        if (!table_has_column($pdo, 'plans', $column)) {
+            $pdo->exec("ALTER TABLE plans ADD COLUMN $column $definition");
+        }
     }
 
     if (column_is_required($pdo, 'todos', 'deadline')) {
@@ -157,7 +168,6 @@ function column_is_required(PDO $pdo, string $table, string $column): bool
 // input check
 class BadInput extends Exception {}
 
-// A real date in the form: YYYY-MM-DD (so not 2026-02-31).
 function check_date($value): string
 {
     if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
@@ -170,7 +180,6 @@ function check_date($value): string
     return $value;
 }
 
-// A time from '00:00' to '23:59', or '24:00' for "until midnight".
 function check_time($value): string
 {
     if ($value === '24:00') return $value;
@@ -193,7 +202,6 @@ function check_text($value, int $maxLength, bool $required = false): string
     return $text;
 }
 
-// Travel time in whole minutes, from 0 up to 12 hours. Accepts 30 or "30".
 function check_travel($value): int
 {
     $isWholeNumber = is_int($value) || (is_string($value) && ctype_digit($value));
@@ -205,6 +213,21 @@ function check_travel($value): int
         throw new BadInput('travel time must be between 0 and 12 hours');
     }
     return $minutes;
+}
+
+function check_notes($value): string
+{
+    $lines = preg_split('/\r\n|\r|\n/', (string)($value ?? ''));
+    $lines = array_values(array_filter(array_map('trim', $lines), fn($line) => $line !== ''));
+    return check_text(implode("\n", $lines), 2000);
+}
+
+function use_device_timezone(): void
+{
+    $timezone = $_SERVER['HTTP_X_TIMEZONE'] ?? '';
+    if ($timezone !== '' && in_array($timezone, timezone_identifiers_list(), true)) {
+        date_default_timezone_set($timezone);
+    }
 }
 
 // Dates
@@ -222,8 +245,6 @@ function days_in_month(int $year, int $month): int
     return (int)date('t', mktime(0, 0, 0, $month, 1, $year));
 }
 
-// The date for this day of the month, or the last day of the month when it is shorter
-// (the 31st in a month of 30 days becomes the 30th).
 function date_in_month(int $year, int $month, int $day): string
 {
     return sprintf('%04d-%02d-%02d', $year, $month, min($day, days_in_month($year, $month)));
